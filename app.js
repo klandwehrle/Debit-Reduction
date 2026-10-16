@@ -2,6 +2,7 @@
 (function () {
   'use strict';
 
+  const APP_BUILD = '1.3 · Oct 16, 2026'; // shown at the bottom of the screens — bump it so you can tell when phones have the update
   const CFG = window.APP_CONFIG || {};
   const API = String(CFG.API_URL || '').trim();
   const $ = (s, r) => (r || document).querySelector(s);
@@ -17,7 +18,12 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage full or blocked */ } },
   };
-  const K = { member: 'dh.member', admin: 'dh.admin', status: 'dh.status', queue: 'dh.queue', dash: 'dh.dash', cat: 'dh.lastCat', email: 'dh.lastEmail' };
+  const K = { member: 'dh.member', admin: 'dh.admin', status: 'dh.status', queue: 'dh.queue', dash: 'dh.dash', cat: 'dh.lastCat', pay: 'dh.lastPay', email: 'dh.lastEmail', names: 'dh.names', lastName: 'dh.lastName' };
+  const PAY = [['Overtime', 'Overtime'], ['Debit Reduction', 'Debit reduction'], ['Split', 'Split']];
+  // Entries saved by the first version of the app had no pay type: they were debit reduction.
+  const qDebit = q => (q.payType === 'Split' ? q.debit : q.payType === 'Overtime' ? 0 : q.hours);
+  const qOt = q => (q.payType === 'Split' ? q.ot : q.payType === 'Overtime' ? q.hours : 0);
+  const payText = e => (e.payType === 'Overtime' ? 'Overtime' : e.payType === 'Split' ? 'Split' : 'Debit');
 
   const S = {
     member: store.get(K.member, null),
@@ -25,6 +31,7 @@
     status: store.get(K.status, null),
     queue: store.get(K.queue, []),
     dash: store.get(K.dash, null),
+    names: store.get(K.names, []), namesLoaded: false, namesError: '',
     tab: 'members', edits: {}, filter: '', sort: 'name', open: null, entryCat: 'All',
     syncing: false, loadingDash: false, lastError: '', installEvt: null,
   };
@@ -101,10 +108,13 @@
     if (!st) return null;
     const pend = myQueue().filter(q => q.date >= st.cycleStart && q.date < st.deadline);
     const pendHours = round2(pend.reduce((a, q) => a + q.hours, 0));
-    const worked = round2(st.worked + pendHours);
+    const pendDebit = round2(pend.reduce((a, q) => a + qDebit(q), 0));
+    const pendOt = round2(pend.reduce((a, q) => a + qOt(q), 0));
+    const worked = round2(st.worked + pendDebit);
+    const overtime = round2((st.overtime || 0) + pendOt);
     const remaining = st.obligated == null ? null : Math.max(0, round2(st.obligated - worked));
     const pct = st.obligated ? Math.min(100, Math.round(worked / st.obligated * 100)) : (st.obligated === 0 ? 100 : 0);
-    return { st, worked, remaining, pct, pendHours };
+    return { st, worked, overtime, remaining, pct, pendHours };
   }
 
   async function refreshStatus(quiet) {
@@ -131,7 +141,7 @@
     if (!batch.length) { renderPill(); return; }
     S.syncing = true; renderPill();
     try {
-      const r = await api('logHours', { token: S.member.token, entries: batch.map(q => ({ id: q.id, date: q.date, category: q.category, hours: q.hours, notes: q.notes })) });
+      const r = await api('logHours', { token: S.member.token, entries: batch.map(q => ({ id: q.id, date: q.date, category: q.category, payType: q.payType || 'Debit Reduction', hours: q.hours, debitHours: qDebit(q), otHours: qOt(q), notes: q.notes })) });
       const done = {};
       r.accepted.forEach(id => { done[id] = true; });
       r.rejected.forEach(x => { done[x.id] = true; });
@@ -157,15 +167,81 @@
   }
 
   /* ───────── views: member ───────── */
+  /* ───────── searchable name list ───────── */
+  const norm = v => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  function filterNames(q) {
+    q = norm(q);
+    if (!q) return S.names.slice();
+    const starts = [], word = [], has = [];
+    S.names.forEach(n => {
+      const l = norm(n);
+      if (l.indexOf(q) === 0) starts.push(n);
+      else if (l.split(' ').some(w => w.indexOf(q) === 0)) word.push(n);
+      else if (l.indexOf(q) > 0) has.push(n);
+    });
+    return starts.concat(word, has);
+  }
+  function hilite(name, q) {
+    q = norm(q);
+    const l = name.toLowerCase();
+    let i = q ? l.indexOf(q) : -1;
+    if (i > 0) { const w = l.search(new RegExp('(^|\\s)' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))); if (w >= 0) i = w + (l[w] === ' ' ? 1 : 0); }
+    if (i < 0) return esc(name);
+    return esc(name.slice(0, i)) + '<mark>' + esc(name.slice(i, i + q.length)) + '</mark>' + esc(name.slice(i + q.length));
+  }
+  function nameListHtml(q) {
+    if (!S.names.length) {
+      return `<li class="nl-empty">${S.namesLoaded ? 'No members found in the sheet.' : (S.namesError || 'Loading names…')}</li>`;
+    }
+    const list = filterNames(q);
+    if (!list.length) return '<li class="nl-empty">No name matches "' + esc(q) + '"</li>';
+    return list.map((n, i) => `<li role="option" class="nl-item ${i === 0 && q ? 'active' : ''}" data-act="pick-name" data-name="${esc(n)}">${hilite(n, q)}</li>`).join('');
+  }
+  function openNameList(show) {
+    const ul = $('#name-list'), inp = $('#name-search');
+    if (!ul || !inp) return;
+    ul.innerHTML = nameListHtml(inp.value);
+    ul.hidden = !show;
+    inp.setAttribute('aria-expanded', show ? 'true' : 'false');
+  }
+  function pickName(n) {
+    const inp = $('#name-search');
+    inp.value = n;
+    $('#member-name').value = n;
+    inp.classList.add('picked');
+    openNameList(false);
+    $('#f-login input[name=password]').focus();
+  }
+  async function loadNames() {
+    if (!navigator.onLine) { if (!S.names.length) S.namesError = 'You\'re offline — connect once to load the member list.'; return; }
+    try {
+      const r = await api('memberNames', {});
+      S.names = r.names || []; S.namesLoaded = true; S.namesError = '';
+      store.set(K.names, S.names);
+    } catch (e) {
+      S.namesError = e.message;
+    }
+    const ul = $('#name-list');
+    if (ul && !ul.hidden) openNameList(true);
+  }
+
   function loginView() {
-    const lastEmail = (S.member && S.member.email) || store.get(K.email, '');
+    const lastName = (S.member && S.member.name) || store.get(K.lastName, '');
+    const known = lastName && S.names.some(n => norm(n) === norm(lastName));
     return `
       <section class="card narrow">
         <h1>Sign in</h1>
-        <p class="muted">Log your Dive Team, SORT and Command Staff Meeting hours toward your debit-day obligation.</p>
+        <p class="muted">Log your Dive Team, SORT and Command Staff Meeting hours as overtime or debit reduction.</p>
         ${S.member && S.member.expired ? '<p class="note">Your sign-in expired. Sign in again — anything waiting on this phone will upload afterwards.</p>' : ''}
         <form id="f-login" class="stack" autocomplete="on">
-          <label>Email<input type="email" name="email" autocomplete="username" required value="${esc(lastEmail)}"></label>
+          <div class="combo">
+            <label for="name-search">Your name</label>
+            <input type="text" id="name-search" role="combobox" aria-autocomplete="list" aria-controls="name-list" aria-expanded="false"
+              autocomplete="off" autocapitalize="words" spellcheck="false" placeholder="Start typing your name…" value="${esc(known ? lastName : '')}" class="${known ? 'picked' : ''}">
+            <input type="hidden" name="memberName" id="member-name" value="${esc(known ? lastName : '')}">
+            <input type="text" name="username" autocomplete="username" value="${esc(known ? lastName : '')}" hidden>
+            <ul id="name-list" class="namelist" role="listbox" hidden></ul>
+          </div>
           <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
           <button class="btn primary" type="submit">Sign in</button>
           <p class="err" id="err"></p>
@@ -188,23 +264,27 @@
 
     let hero;
     if (st.obligated == null) {
-      hero = `<div class="big"><span class="num">${fmtH(d.worked)}</span><span class="unit">hrs worked</span></div>
-        <p class="muted">Your obligation hasn't been entered yet. Your hours still count — an admin will set your total.</p>`;
+      hero = `<div class="big"><span class="num">${fmtH(d.worked)}</span><span class="unit">debit hrs worked</span></div>
+        <p class="muted">Your debit reduction obligation hasn't been entered yet. Your hours still count — an admin will set your total.</p>`;
     } else if (d.remaining === 0) {
       hero = `<div class="big done"><span class="num">✓</span><span class="unit">Obligation met</span></div>
         <div class="bar"><i style="width:100%"></i></div>
-        <p class="muted">${hrs(d.worked)} worked of ${hrs(st.obligated)} obligated.</p>`;
+        <p class="muted">${hrs(d.worked)} debit reduction worked of ${hrs(st.obligated)} obligated.</p>`;
     } else {
-      hero = `<div class="big"><span class="num">${fmtH(d.remaining)}</span><span class="unit">hrs remaining</span></div>
+      hero = `<div class="big"><span class="num">${fmtH(d.remaining)}</span><span class="unit">debit hrs remaining</span></div>
         <div class="bar"><i style="width:${d.pct}%"></i></div>
-        <p class="muted">${hrs(d.worked)} worked of ${hrs(st.obligated)} obligated</p>`;
+        <p class="muted">${hrs(d.worked)} debit reduction worked of ${hrs(st.obligated)} obligated</p>`;
     }
     const dueTxt = days > 1 ? `Due ${pretty(st.deadline)} · ${days} days left` : days === 1 ? `Due tomorrow (${pretty(st.deadline)})` : days === 0 ? 'Due today' : `Deadline ${pretty(st.deadline)} has passed`;
 
     const cats = st.categories.map((c, i) => `
       <label class="seg"><input type="radio" name="category" value="${esc(c)}" ${c === cat ? 'checked' : ''}><span>${esc(c)}</span></label>`).join('');
 
-    const breakdown = st.categories.map(c => `<div><span>${esc(c)}</span><b>${fmtH((st.byCategory || {})[c] || 0)}</b></div>`).join('');
+    const breakdown = catBreakdown(st.categories, st.byCategory, st.otByCategory);
+    const lastPay = store.get(K.pay, 'Debit Reduction');
+    const pay = PAY.some(x => x[0] === lastPay) ? lastPay : 'Debit Reduction';
+    const pays = PAY.map(x => `
+      <label class="seg pay"><input type="radio" name="payType" value="${x[0]}" ${x[0] === pay ? 'checked' : ''}><span>${x[1]}</span></label>`).join('');
 
     const pendList = pending.map(q => entryItem(q, true)).join('');
     const recent = (st.entries || []).map(e => entryItem(e, false)).join('');
@@ -214,6 +294,7 @@
         <p class="hello">Hi ${esc(first || 'there')}</p>
         ${hero}
         <p class="due ${days <= 7 ? 'soon' : ''}">${dueTxt}</p>
+        <div class="otline"><span>Overtime this year</span><b>${hrs(d.overtime)}</b></div>
         <div class="breakdown">${breakdown}</div>
         <p class="tiny muted">${d.pendHours ? 'Includes ' + hrs(d.pendHours) + ' waiting to upload. ' : ''}Updated ${ago(st.asOf)}</p>
       </section>
@@ -222,11 +303,16 @@
         <h2>Log hours</h2>
         <form id="f-log" class="stack">
           <fieldset class="segs"><legend>Type</legend>${cats}</fieldset>
-          <div class="row2">
-            <label>Date worked<input type="date" name="date" required value="${todayYmd()}" max="${todayYmd()}"></label>
-            <label>Hours<input type="number" name="hours" inputmode="decimal" min="0.25" max="${st.maxHours}" step="0.25" required placeholder="0"></label>
+          <fieldset class="segs"><legend>Pay as</legend>${pays}</fieldset>
+          <label>Date worked<input type="date" name="date" required value="${todayYmd()}" max="${todayYmd()}"></label>
+          <div class="one-h" ${pay === 'Split' ? 'hidden' : ''}>
+            <label><span class="h-label">${pay === 'Overtime' ? 'Overtime hours' : 'Debit reduction hours'}</span><input type="number" name="hours" inputmode="decimal" min="0.25" max="${st.maxHours}" step="0.25" placeholder="0"></label>
+            <div class="chips">${[1, 2, 3, 4, 8].map(n => `<button type="button" class="chip" data-act="hours" data-h="${n}">${n} hr${n > 1 ? 's' : ''}</button>`).join('')}</div>
           </div>
-          <div class="chips">${[1, 2, 3, 4, 8].map(n => `<button type="button" class="chip" data-act="hours" data-h="${n}">${n} hr${n > 1 ? 's' : ''}</button>`).join('')}</div>
+          <div class="split-h row2" ${pay === 'Split' ? '' : 'hidden'}>
+            <label>Debit reduction hours<input type="number" name="debitHours" inputmode="decimal" min="0.25" step="0.25" placeholder="0"></label>
+            <label>Overtime hours<input type="number" name="otHours" inputmode="decimal" min="0.25" step="0.25" placeholder="0"></label>
+          </div>
           <label>Notes <span class="muted">(optional)</span><input type="text" name="notes" maxlength="500" placeholder="e.g. Rope drill at Station 31"></label>
           <button class="btn primary" type="submit">Log hours</button>
         </form>
@@ -243,11 +329,24 @@
       <nav class="links"><a href="#/install">Install on phone</a><span>·</span><a href="#/admin">Admin</a><span>·</span><a href="#" data-act="signout">Sign out</a></nav>`;
   }
 
+  function catBreakdown(cats, deb, ot) {
+    return cats.map(c => {
+      const o = (ot || {})[c] || 0;
+      return `<div><span>${esc(c)}</span><b>${fmtH((deb || {})[c] || 0)}<small> debit</small></b>${o ? `<em>${fmtH(o)} OT</em>` : ''}</div>`;
+    }).join('');
+  }
+  function payTag(e) {
+    const t = payText(e);
+    const cls = t === 'Overtime' ? 'ot' : t === 'Split' ? 'split' : 'debit';
+    const txt = t === 'Split' ? `Split ${fmtH(qDebit(e))} debit / ${fmtH(qOt(e))} OT` : t === 'Overtime' ? 'Overtime' : 'Debit reduction';
+    return `<span class="tag ${cls}">${txt}</span> `;
+  }
+
   function entryItem(e, pending) {
     const voided = String(e.status || '').toLowerCase() === 'void';
-    const tag = pending ? '<span class="tag wait">Waiting</span>'
+    const tag = payTag(e) + (pending ? '<span class="tag wait">Waiting</span>'
       : voided ? '<span class="tag void">Removed</span>'
-      : e.counted === false ? '<span class="tag">Not this year</span>' : '';
+      : e.counted === false ? '<span class="tag">Not this year</span>' : '');
     return `<li class="entry ${voided ? 'voided' : ''}">
       <div class="e-main"><b>${esc(e.category)}</b> ${tag}<span class="muted">${weekday(e.date)} ${pretty(e.date)}${e.notes ? ' · ' + esc(e.notes) : ''}</span>
       ${voided && e.voidReason ? `<span class="tiny muted">Reason: ${esc(e.voidReason)}</span>` : ''}</div>
@@ -325,10 +424,10 @@
           <label class="ob">Obligated<input type="number" inputmode="decimal" min="0" step="0.5" data-ob="${esc(m.email)}" value="${esc(memberVal(m))}" placeholder="—"></label>
         </div>
         <div class="bar thin"><i style="width:${pct}%"></i></div>
-        <div class="mnums"><span>Worked <b>${fmtH(m.worked)}</b></span><span>Remaining <b class="${m.remaining > 0 ? 'red' : ''}">${m.remaining == null ? '—' : fmtH(m.remaining)}</b></span>
+        <div class="mnums"><span>Debit worked <b>${fmtH(m.worked)}</b></span><span>Remaining <b class="${m.remaining > 0 ? 'red' : ''}">${m.remaining == null ? '—' : fmtH(m.remaining)}</b></span><span>OT <b>${fmtH(m.overtime || 0)}</b></span>
           <span class="muted">${m.lastDate ? 'Last ' + pretty(m.lastDate, true) : 'No hours yet'}</span></div>
         ${open ? `<div class="mdetail">
-          <div class="breakdown">${D.categories.map(c => `<div><span>${esc(c)}</span><b>${fmtH(m.byCategory[c] || 0)}</b></div>`).join('')}</div>
+          <div class="breakdown">${catBreakdown(D.categories, m.byCategory, m.otByCategory)}</div>
           ${ents.length ? `<ul class="entries">${ents.map(e => adminEntryItem(e, false)).join('')}</ul>` : '<p class="muted">No entries this year.</p>'}
         </div>` : ''}
       </div>`;
@@ -337,8 +436,9 @@
     return `
       <div class="stats">
         <div><b>${complete}/${act.length}</b><span>complete</span></div>
-        <div><b>${sum('worked')}</b><span>hrs worked</span></div>
-        <div><b>${sum('remaining')}</b><span>hrs remaining</span></div>
+        <div><b>${sum('worked')}</b><span>debit hrs worked</span></div>
+        <div><b>${sum('remaining')}</b><span>debit hrs remaining</span></div>
+        <div><b>${sum('overtime')}</b><span>overtime hrs</span></div>
         <div><b>${days >= 0 ? days : '—'}</b><span>days to ${pretty(D.settings.DEADLINE, true)}</span></div>
       </div>
       <div class="tools">
@@ -355,6 +455,7 @@
     const voided = String(e.status).toLowerCase() === 'void';
     return `<li class="entry ${voided ? 'voided' : ''}">
       <div class="e-main"><b>${showName ? esc(e.name || e.email) + ' · ' : ''}${esc(e.category)}</b>
+        <span>${payTag(e)}</span>
         ${voided ? '<span class="tag void">Removed</span>' : e.counted ? '' : '<span class="tag">Not this year</span>'}
         <span class="muted">${weekday(e.date)} ${pretty(e.date)}${e.notes ? ' · ' + esc(e.notes) : ''}</span>
         ${voided && e.voidReason ? `<span class="tiny muted">Reason: ${esc(e.voidReason)}</span>` : ''}</div>
@@ -368,7 +469,7 @@
     const list = D.entries.filter(e => S.entryCat === 'All' || e.category === S.entryCat);
     return `
       <div class="chips">${cats.map(c => `<button class="chip ${S.entryCat === c ? 'on' : ''}" data-act="ecat" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}</div>
-      <p class="tiny muted">${list.length} entries since ${pretty(D.settings.CYCLE_START)}. "Remove" takes an entry out of the totals (it stays in the sheet marked Void).</p>
+      <p class="tiny muted">${list.length} entries (${hrs(list.filter(e => e.counted && String(e.status).toLowerCase() !== 'void').reduce((a, e) => a + (e.ot || 0), 0))} overtime) since ${pretty(D.settings.CYCLE_START)}. "Remove" takes an entry out of the totals (it stays in the sheet marked Void).</p>
       <ul class="entries">${list.map(e => adminEntryItem(e, true)).join('') || '<li class="muted">No entries.</li>'}</ul>`;
   }
 
@@ -483,7 +584,7 @@
     else html = S.member ? homeView() : loginView();
     const y = window.scrollY;
     const focus = document.activeElement && document.activeElement.id;
-    app.innerHTML = html;
+    app.innerHTML = html + `<p class="build">Version ${APP_BUILD}</p>`;
     window.scrollTo(0, y);
     if (focus && $('#' + focus)) { const el = $('#' + focus); el.focus(); if (el.setSelectionRange && el.type === 'search') el.setSelectionRange(el.value.length, el.value.length); }
     $$('[data-ob]').forEach(inp => { if (Object.prototype.hasOwnProperty.call(S.edits, inp.dataset.ob)) inp.classList.add('changed'); });
@@ -506,14 +607,22 @@
       if (err) err.textContent = '';
       btn.disabled = true; btn.textContent = 'Signing in…';
       try {
-        const email = fd.email.trim().toLowerCase();
-        store.set(K.email, email);
         if (f.id === 'f-login') {
-          const r = await api('login', { email: email, password: fd.password });
+          const typed = $('#name-search').value;
+          const name = fd.memberName || S.names.find(n => norm(n) === norm(typed)) || '';
+          if (!name) {
+            const one = filterNames(typed);
+            throw new ApiError(one.length === 1 && typed ? 'Tap your name in the list: ' + one[0] : 'Pick your name from the list.');
+          }
+          store.set(K.lastName, name);
+          const r = await api('login', { name: name, password: fd.password });
+          store.set(K.email, r.email);
           S.member = { token: r.token, name: r.name, email: r.email };
           S.status = r.status; save('member'); save('status');
           render(); sync();
         } else {
+          const email = fd.email.trim().toLowerCase();
+          store.set(K.email, email);
           const r = await api('adminLogin', { email: email, password: fd.password });
           S.admin = { token: r.token, email: r.email, name: r.name }; save('admin');
           S.tab = 'members';
@@ -528,17 +637,26 @@
 
     if (f.id === 'f-log') {
       const st = S.status;
-      const hours = round2(fd.hours);
+      const payType = fd.payType;
       const date = fd.date;
+      let debit = 0, ot = 0;
+      if (payType === 'Split') { debit = round2(fd.debitHours); ot = round2(fd.otHours); }
+      else if (payType === 'Overtime') ot = round2(fd.hours);
+      else debit = round2(fd.hours);
+      const hours = round2(debit + ot);
       if (!fd.category) return toast('Pick a type of hours.', 'bad');
+      if (!payType) return toast('Pick Overtime, Debit reduction or Split.', 'bad');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return toast('Pick the date you worked.', 'bad');
       if (date > todayYmd()) return toast('The date can\'t be in the future.', 'bad');
+      if (debit < 0 || ot < 0) return toast('Hours can\'t be negative.', 'bad');
+      if (payType === 'Split' && !(debit > 0 && ot > 0)) return toast('For a split, enter both debit reduction and overtime hours.', 'bad');
       if (!(hours > 0)) return toast('Enter the number of hours.', 'bad');
       if (hours > st.maxHours) return toast('That\'s more than ' + st.maxHours + ' hours in one entry.', 'bad');
       if (date < st.cycleStart && !confirm('That date is before ' + pretty(st.cycleStart) + ', so it won\'t count toward this year\'s obligation. Log it anyway?')) return;
-      S.queue.push({ id: uuid(), email: S.member.email, date: date, category: fd.category, hours: hours, notes: (fd.notes || '').trim(), createdAt: new Date().toISOString() });
+      S.queue.push({ id: uuid(), email: S.member.email, date: date, category: fd.category, payType: payType, hours: hours, debit: debit, ot: ot, notes: (fd.notes || '').trim(), createdAt: new Date().toISOString() });
       save('queue');
       store.set(K.cat, fd.category);
+      store.set(K.pay, payType);
       render();
       if (navigator.onLine) { toast('Saved — uploading…'); sync(); }
       else toast('Saved on this phone. It will upload when you have signal.', 'good');
@@ -562,10 +680,23 @@
       updateSaveBar();
     } else if (t.id === 'm-filter') {
       S.filter = t.value; render();
+    } else if (t.id === 'name-search') {
+      $('#member-name').value = '';
+      t.classList.remove('picked');
+      const exact = S.names.find(n => norm(n) === norm(t.value));
+      if (exact) $('#member-name').value = exact;
+      openNameList(true);
     }
   });
   document.addEventListener('change', ev => {
     if (ev.target.id === 'm-sort') { S.sort = ev.target.value; render(); }
+    if (ev.target.name === 'payType') {
+      const f = ev.target.form, v = ev.target.value;
+      f.querySelector('.one-h').hidden = v === 'Split';
+      f.querySelector('.split-h').hidden = v !== 'Split';
+      f.querySelector('.h-label').textContent = v === 'Overtime' ? 'Overtime hours' : 'Debit reduction hours';
+      store.set(K.pay, v);
+    }
   });
 
   document.addEventListener('click', async ev => {
@@ -575,6 +706,7 @@
     if (el.tagName === 'A') ev.preventDefault();
 
     switch (act) {
+      case 'pick-name': pickName(el.dataset.name); break;
       case 'hours': { const i = $('#f-log input[name=hours]'); i.value = el.dataset.h; break; }
       case 'sync': sync(); break;
       case 'refresh': el.textContent = 'Refreshing…'; await sync(true); await refreshStatus(); break;
@@ -653,21 +785,56 @@
     }
   });
 
+  document.addEventListener('focusin', ev => {
+    if (ev.target.id === 'name-search') { ev.target.select(); openNameList(true); }
+  });
+  document.addEventListener('pointerdown', ev => {
+    if (!ev.target.closest('.combo')) openNameList(false);
+  });
+  document.addEventListener('keydown', ev => {
+    if (ev.target.id !== 'name-search') return;
+    const items = $$('#name-list .nl-item');
+    let i = items.findIndex(x => x.classList.contains('active'));
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if ($('#name-list').hidden) openNameList(true);
+      const list = $$('#name-list .nl-item');
+      if (!list.length) return;
+      if (i >= 0 && list[i]) list[i].classList.remove('active');
+      i = ev.key === 'ArrowDown' ? Math.min(list.length - 1, i + 1) : Math.max(0, i - 1);
+      list[i].classList.add('active'); list[i].scrollIntoView({ block: 'nearest' });
+    } else if (ev.key === 'Enter' && !$('#name-list').hidden && items.length) {
+      ev.preventDefault();
+      pickName((items[i >= 0 ? i : 0]).dataset.name);
+    } else if (ev.key === 'Escape') openNameList(false);
+  });
+
   window.addEventListener('hashchange', () => {
     window.scrollTo(0, 0);
     render();
     if (route().indexOf('/admin') === 0 && S.admin && navigator.onLine) loadDash(true);
   });
-  window.addEventListener('online', () => { render(); sync(true).then(() => refreshStatus(true)); if (S.admin && route().indexOf('/admin') === 0) loadDash(true); });
+  window.addEventListener('online', () => { if (!S.namesLoaded) loadNames(); render(); sync(true).then(() => refreshStatus(true)); if (S.admin && route().indexOf('/admin') === 0) loadDash(true); });
   window.addEventListener('offline', render);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(true); });
   window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (route().indexOf('/install') === 0) render(); });
 
   /* ───────── start ───────── */
-  if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(reg => {
+      // Check GitHub for a new version every time the app is brought to the front.
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+    }).catch(() => {});
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController) return; // first install, nothing to refresh
+      const busy = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+      if (busy) toast('App updated — it will refresh next time you open it.');
+      else location.reload();
+    });
   }
   render();
+  loadNames();
   if (S.member && !S.member.expired) { sync(true).then(() => refreshStatus(true)); }
   if (S.admin && route().indexOf('/admin') === 0) loadDash(!!S.dash);
 })();
