@@ -1,5 +1,5 @@
 // Paste your Apps Script Web App URL (ends in /exec) between the quotes.
 window.APP_CONFIG = {
   API_URL: 'https://script.google.com/macros/s/AKfycbwczjpvjD7-g2B4GDmnEh_ts6BmV1Kzr_gv0jHA3M7S53RtlFfPFPlSxO7bZzOpDixv/exec',
-  APP_NAME: 'Debit Hours'
+  APP_NAME: 'Debit Reduction'
 };
